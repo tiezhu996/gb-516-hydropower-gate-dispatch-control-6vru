@@ -17,6 +17,12 @@ type OperationDirective struct {
 	Evidence    string              `json:"evidence" gorm:"size:2000"`
 	RelatedCode string              `json:"relatedCode" gorm:"size:64;index"`
 	GateState   string              `json:"gateState" gorm:"size:32;not null;default:closed"`
+	// 调度许可条件：只有在许可时段内、且目标闸门所属库区当前水位处于
+	// [MinWaterLevel, MaxWaterLevel] 区间时，复核通过的指令才允许开始执行。
+	PermitStartAt time.Time `json:"permitStartAt"`
+	PermitEndAt   time.Time `json:"permitEndAt"`
+	MinWaterLevel float64   `json:"minWaterLevel"`
+	MaxWaterLevel float64   `json:"maxWaterLevel"`
 	SubmittedBy string              `json:"submittedBy" gorm:"size:80;index"`
 	SubmittedAt *time.Time          `json:"submittedAt"`
 	ApprovedBy  string              `json:"approvedBy" gorm:"size:80;index"`

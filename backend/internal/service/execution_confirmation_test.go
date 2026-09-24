@@ -22,16 +22,22 @@ func newExecutionWorkflow(t *testing.T) (ExecutionConfirmationService, Operation
 	}
 	sqlDB, _ := db.DB()
 	sqlDB.SetMaxOpenConns(1)
-	if err := db.AutoMigrate(&model.GateUnit{}, &model.OperationDirective{}, &model.DirectiveApproval{}, &model.ExecutionConfirmation{}, &model.AuditLog{}); err != nil {
+	if err := db.AutoMigrate(&model.Reservoir{}, &model.GateUnit{}, &model.OperationDirective{}, &model.DirectiveApproval{}, &model.ExecutionConfirmation{}, &model.AuditLog{}); err != nil {
 		t.Fatalf("migrate test database: %v", err)
 	}
+	reservoirRepo := repository.NewReservoirRepository(db)
 	gateRepo := repository.NewGateUnitRepository(db)
 	directiveRepo := repository.NewOperationDirectiveRepository(db)
 	confirmationRepo := repository.NewExecutionConfirmationRepository(db)
 	security := NewSecurityService(repository.NewSecurityRepository(db), config.Config{})
-	directives := NewOperationDirectiveService(directiveRepo, gateRepo, security)
+	directives := NewOperationDirectiveService(directiveRepo, gateRepo, reservoirRepo, security)
 	confirmations := NewExecutionConfirmationService(confirmationRepo, directiveRepo, gateRepo, security)
-	gate := model.GateUnit{BaseModel: model.BaseModel{Code: "GU-FLOW", Name: "泄洪闸", Status: "closed", Version: 1}, Facility: "主坝", Owner: "运行一组"}
+	reservoir := model.Reservoir{BaseModel: model.BaseModel{Code: "R-FLOW", Name: "主坝库区", Status: "normal", Version: 1},
+		Facility: "主坝", Owner: "运行一组", MetricValue: 100.0, MetricUnit: "m"}
+	if err := reservoirRepo.Create(context.Background(), &reservoir); err != nil {
+		t.Fatalf("create reservoir: %v", err)
+	}
+	gate := model.GateUnit{BaseModel: model.BaseModel{Code: "GU-FLOW", Name: "泄洪闸", Status: "closed", Version: 1}, Facility: "主坝", Owner: "运行一组", RelatedCode: "R-FLOW"}
 	if err := gateRepo.Create(context.Background(), &gate); err != nil {
 		t.Fatalf("create gate: %v", err)
 	}
@@ -41,11 +47,14 @@ func newExecutionWorkflow(t *testing.T) (ExecutionConfirmationService, Operation
 func prepareExecutingDirective(t *testing.T, directives OperationDirectiveService) model.OperationDirective {
 	t.Helper()
 	ctx := context.Background()
+	now := time.Now().UTC()
 	created, err := directives.Create(ctx, dto.CreateOperationDirective{
 		Code: "OD-FLOW", Name: "开启泄洪闸", Facility: "主坝", Owner: "运行一组",
 		Category: "泄洪", RiskLevel: "high", MetricValue: 35, MetricUnit: "%",
-		EffectiveAt: time.Now().UTC().Add(time.Hour), Evidence: "水位与通信核对完成",
+		EffectiveAt: now.Add(time.Hour), Evidence: "水位与通信核对完成",
 		RelatedCode: "GU-FLOW", GateState: "open",
+		PermitStartAt: now.Add(-2 * time.Hour), PermitEndAt: now.Add(2 * time.Hour),
+		MinWaterLevel: 90.0, MaxWaterLevel: 120.0,
 	}, "operator", "req-create")
 	if err != nil {
 		t.Fatalf("create directive: %v", err)

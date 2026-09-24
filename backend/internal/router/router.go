@@ -34,7 +34,7 @@ func New(cfg config.Config, db *gorm.DB, redisClient *redis.Client, logger *slog
 	executionConfirmationRepository := repository.NewExecutionConfirmationRepository(db)
 	reservoirService := service.NewReservoirService(reservoirRepository, securityService)
 	gateUnitService := service.NewGateUnitService(gateUnitRepository, reservoirRepository, securityService)
-	operationDirectiveService := service.NewOperationDirectiveService(operationDirectiveRepository, gateUnitRepository, securityService)
+	operationDirectiveService := service.NewOperationDirectiveService(operationDirectiveRepository, gateUnitRepository, reservoirRepository, securityService)
 	executionConfirmationService := service.NewExecutionConfirmationService(executionConfirmationRepository, operationDirectiveRepository, gateUnitRepository, securityService)
 	reservoirHandler := handler.NewReservoirHandler(reservoirService)
 	gateUnitHandler := handler.NewGateUnitHandler(gateUnitService)

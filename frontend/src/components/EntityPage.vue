@@ -23,7 +23,26 @@ const relatedOptions = ref<DomainRecord[]>([]);
 const createForm = reactive({
   code: '', name: '', description: '', facility: '', owner: '', category: '',
   riskLevel: 'medium', metricValue: 0, metricUnit: '%', evidence: '', relatedCode: '', gateState: 'closed',
+  permitStartAt: '', permitEndAt: '', minWaterLevel: 0, maxWaterLevel: 0,
 });
+
+// el-date-picker 返回 "YYYY-MM-DD HH:mm"，转成 "YYYY-MM-DDTHH:mm" 再按本地时间解析。
+function parseLocalDatetime(value: string): Date {
+  return new Date(value.replace(' ', 'T'));
+}
+
+// 操作指令的调度许可条件：许可时段 + 库区水位上下限，建单时必须完整且自洽。
+const permitHint = computed(() => {
+  if (props.config.key !== 'operationDirective') return '';
+  if (!createForm.permitStartAt || !createForm.permitEndAt) return '请完整选择许可开始与结束时间';
+  if (parseLocalDatetime(createForm.permitStartAt).getTime() >= parseLocalDatetime(createForm.permitEndAt).getTime()) {
+    return '许可开始时间必须早于结束时间';
+  }
+  if (createForm.minWaterLevel <= 0 || createForm.maxWaterLevel <= 0) return '请录入大于 0 的水位上下限';
+  if (createForm.minWaterLevel > createForm.maxWaterLevel) return '最低水位不能高于最高水位';
+  return '';
+});
+const permitReady = computed(() => props.config.key !== 'operationDirective' || permitHint.value === '');
 
 const highRisk = computed(() => props.store.items.filter((item: DomainRecord) => ['high', 'critical'].includes(item.riskLevel)).length);
 const canCreate = computed(() => can('operator', 'admin'));
@@ -50,7 +69,8 @@ const relationLabel = computed(() => ({ gateUnit: '所属库区', operationDirec
 const createReady = computed(() => Boolean(
 	createForm.code.trim() && createForm.name.trim() && createForm.facility.trim() && createForm.owner.trim() &&
 	createForm.category.trim() && createForm.evidence.trim() &&
-	(!['gateUnit', 'operationDirective', 'executionConfirmation'].includes(props.config.key) || createForm.relatedCode),
+	(!['gateUnit', 'operationDirective', 'executionConfirmation'].includes(props.config.key) || createForm.relatedCode) &&
+	permitReady.value,
 ));
 
 async function prepareCreate(): Promise<void> {
@@ -66,6 +86,10 @@ async function prepareCreate(): Promise<void> {
 	createForm.evidence = '';
 	createForm.relatedCode = '';
   createForm.gateState = 'closed';
+	createForm.permitStartAt = toLocalDatetimeInput(new Date());
+	createForm.permitEndAt = toLocalDatetimeInput(new Date(Date.now() + 24 * 60 * 60 * 1000));
+	createForm.minWaterLevel = 0;
+	createForm.maxWaterLevel = 0;
 	relatedOptions.value = [];
 	const relationPaths: Record<string, string> = { gateUnit: 'reservoirs', operationDirective: 'gates', executionConfirmation: 'directives' };
 	try {
@@ -90,12 +114,25 @@ function selectRelated(code: string): void {
 	if (related) createForm.facility = related.facility;
 }
 
+// el-date-picker 的本地时间值需要转成 ISO 字符串，后端按 RFC3339 解析并存为 UTC。
+function toLocalDatetimeInput(value: Date): string {
+	const pad = (part: number): string => String(part).padStart(2, '0');
+	return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}`;
+}
+
 async function createRecord(): Promise<void> {
 	if (!createReady.value) {
-		props.store.error = '请完整填写必填业务字段和现场证据';
+		props.store.error = props.config.key === 'operationDirective' && permitHint.value
+			? `许可条件不满足：${permitHint.value}`
+			: '请完整填写必填业务字段和现场证据';
 		return;
 	}
-  await props.store.createRecord(props.config.path, { ...createForm, effectiveAt: new Date().toISOString() });
+	const payload: Record<string, unknown> = { ...createForm, effectiveAt: new Date().toISOString() };
+	if (props.config.key === 'operationDirective') {
+		payload.permitStartAt = parseLocalDatetime(createForm.permitStartAt).toISOString();
+		payload.permitEndAt = parseLocalDatetime(createForm.permitEndAt).toISOString();
+	}
+  await props.store.createRecord(props.config.path, payload);
   if (!props.store.error) showCreate.value = false;
 }
 
@@ -165,6 +202,22 @@ async function confirmTransition(): Promise<void> {
 		<el-table-column v-if="config.key === 'operationDirective'" label="目标状态" width="120">
           <template #default="{ row }"><GateStateBadge :state="row.gateState || 'closed'" /></template>
         </el-table-column>
+		<el-table-column v-if="config.key === 'operationDirective'" label="许可时段" min-width="220">
+          <template #default="{ row }">
+            <small v-if="row.permitStartAt && row.permitEndAt">
+              {{ formatDate(row.permitStartAt) }} 至<br />{{ formatDate(row.permitEndAt) }}
+            </small>
+            <span v-else class="muted">未设置</span>
+          </template>
+        </el-table-column>
+		<el-table-column v-if="config.key === 'operationDirective'" label="许可水位" width="130">
+          <template #default="{ row }">
+            <small v-if="row.minWaterLevel != null && row.maxWaterLevel != null">
+              {{ row.minWaterLevel }} ~ {{ row.maxWaterLevel }} m
+            </small>
+            <span v-else class="muted">未设置</span>
+          </template>
+        </el-table-column>
 		<el-table-column label="风险" width="80"><template #default="{ row }">{{ riskLabel(row.riskLevel) }}</template></el-table-column>
         <el-table-column prop="owner" label="责任人" min-width="110" />
 		<el-table-column v-if="['gateUnit', 'operationDirective', 'executionConfirmation'].includes(config.key)" prop="relatedCode" :label="relationLabel" width="130" />
@@ -200,6 +253,20 @@ async function confirmTransition(): Promise<void> {
 		  <el-form-item label="指标单位"><el-input v-model="createForm.metricUnit" /></el-form-item>
 		  <el-form-item v-if="config.key === 'operationDirective'" label="目标闸门状态"><el-select v-model="createForm.gateState"><el-option v-for="state in ['open', 'closed', 'locked']" :key="state" :label="statusLabel(state)" :value="state" /></el-select></el-form-item>
         </div>
+		<div v-if="config.key === 'operationDirective'" class="permit-panel">
+		  <h4>调度许可条件</h4>
+		  <el-alert :title="permitHint || '复核通过后，仅在许可时段内且库区当前水位处于上下限区间时才允许开始执行。'" :type="permitHint ? 'error' : 'info'" :closable="false" show-icon />
+		  <div class="form-grid">
+		    <el-form-item label="许可开始时间">
+			  <el-date-picker v-model="createForm.permitStartAt" type="datetime" format="YYYY-MM-DD HH:mm" value-format="YYYY-MM-DD HH:mm" placeholder="选择开始时间" class="full-width" />
+			</el-form-item>
+		    <el-form-item label="许可结束时间">
+			  <el-date-picker v-model="createForm.permitEndAt" type="datetime" format="YYYY-MM-DD HH:mm" value-format="YYYY-MM-DD HH:mm" placeholder="选择结束时间" class="full-width" />
+			</el-form-item>
+		    <el-form-item label="最低水位（m）"><el-input-number v-model="createForm.minWaterLevel" :min="0" :precision="2" controls-position="right" class="full-width" /></el-form-item>
+		    <el-form-item label="最高水位（m）"><el-input-number v-model="createForm.maxWaterLevel" :min="0" :precision="2" controls-position="right" class="full-width" /></el-form-item>
+		  </div>
+		</div>
 		<el-form-item label="业务说明"><el-input v-model="createForm.description" type="textarea" :rows="2" maxlength="1000" show-word-limit /></el-form-item>
         <el-form-item label="现场证据"><el-input v-model="createForm.evidence" type="textarea" :rows="3" /></el-form-item>
       </el-form>

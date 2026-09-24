@@ -21,6 +21,8 @@ func handleError(c *gin.Context, err error) {
 		util.Fail(c, http.StatusForbidden, "forbidden", err.Error())
 	case errors.Is(err, service.ErrTwoPersonRequired), errors.Is(err, service.ErrImmutableState):
 		util.Fail(c, http.StatusConflict, "safety_rule", err.Error())
+	case errors.Is(err, service.ErrPermitWindow):
+		util.Fail(c, http.StatusUnprocessableEntity, "permit_window", err.Error())
 	case errors.Is(err, service.ErrInvalidTransition), errors.Is(err, service.ErrInvalidInput):
 		util.Fail(c, http.StatusUnprocessableEntity, "business_rule", err.Error())
 	default:

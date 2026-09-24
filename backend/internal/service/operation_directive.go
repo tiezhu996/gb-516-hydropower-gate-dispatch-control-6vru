@@ -25,11 +25,12 @@ type OperationDirectiveService interface {
 type operationDirectiveService struct {
 	repository repository.OperationDirectiveRepository
 	gates      repository.GateUnitRepository
+	reservoirs repository.ReservoirRepository
 	security   SecurityService
 }
 
-func NewOperationDirectiveService(repo repository.OperationDirectiveRepository, gates repository.GateUnitRepository, security SecurityService) OperationDirectiveService {
-	return &operationDirectiveService{repository: repo, gates: gates, security: security}
+func NewOperationDirectiveService(repo repository.OperationDirectiveRepository, gates repository.GateUnitRepository, reservoirs repository.ReservoirRepository, security SecurityService) OperationDirectiveService {
+	return &operationDirectiveService{repository: repo, gates: gates, reservoirs: reservoirs, security: security}
 }
 
 func (s *operationDirectiveService) List(ctx context.Context, query dto.PageQuery) (repository.Page[model.OperationDirective], error) {
@@ -42,6 +43,9 @@ func (s *operationDirectiveService) Get(ctx context.Context, id uint) (model.Ope
 
 func (s *operationDirectiveService) Create(ctx context.Context, input dto.CreateOperationDirective, actor, requestID string) (model.OperationDirective, error) {
 	if err := validateOperationDirectiveBusinessFields(input.Code, input.Name, input.Facility, input.Owner); err != nil {
+		return model.OperationDirective{}, err
+	}
+	if err := validatePermitWindow(input.PermitStartAt, input.PermitEndAt, input.MinWaterLevel, input.MaxWaterLevel); err != nil {
 		return model.OperationDirective{}, err
 	}
 	gate, err := s.gates.GetByCode(ctx, input.RelatedCode)
@@ -65,6 +69,8 @@ func (s *operationDirectiveService) Create(ctx context.Context, input dto.Create
 		MetricValue: input.MetricValue, MetricUnit: strings.TrimSpace(input.MetricUnit),
 		EffectiveAt: input.EffectiveAt.UTC(), Evidence: strings.TrimSpace(input.Evidence),
 		RelatedCode: strings.ToUpper(strings.TrimSpace(input.RelatedCode)), GateState: gateState,
+		PermitStartAt: input.PermitStartAt.UTC(), PermitEndAt: input.PermitEndAt.UTC(),
+		MinWaterLevel: input.MinWaterLevel, MaxWaterLevel: input.MaxWaterLevel,
 	}
 	if err := s.security.WithinTransaction(ctx, func(txCtx context.Context) error {
 		if err := s.repository.Create(txCtx, &item); err != nil {
@@ -88,6 +94,9 @@ func (s *operationDirectiveService) Update(ctx context.Context, id uint, input d
 	if err := validateOperationDirectiveBusinessFields(current.Code, input.Name, input.Facility, input.Owner); err != nil {
 		return model.OperationDirective{}, err
 	}
+	if err := validatePermitWindow(input.PermitStartAt, input.PermitEndAt, input.MinWaterLevel, input.MaxWaterLevel); err != nil {
+		return model.OperationDirective{}, err
+	}
 	gate, err := s.gates.GetByCode(ctx, input.RelatedCode)
 	if err != nil {
 		return model.OperationDirective{}, fmt.Errorf("linked gate %q: %w", input.RelatedCode, err)
@@ -106,6 +115,10 @@ func (s *operationDirectiveService) Update(ctx context.Context, id uint, input d
 	current.EffectiveAt = input.EffectiveAt.UTC()
 	current.Evidence = strings.TrimSpace(input.Evidence)
 	current.RelatedCode = strings.ToUpper(strings.TrimSpace(input.RelatedCode))
+	current.PermitStartAt = input.PermitStartAt.UTC()
+	current.PermitEndAt = input.PermitEndAt.UTC()
+	current.MinWaterLevel = input.MinWaterLevel
+	current.MaxWaterLevel = input.MaxWaterLevel
 	if gateState := strings.TrimSpace(input.GateState); gateState != "" {
 		current.GateState = gateState
 	}
@@ -146,6 +159,11 @@ func (s *operationDirectiveService) Transition(ctx context.Context, id uint, inp
 		}
 		if target == string(constants.DirectiveStateExecuting) && linkedGate.Status == string(constants.GateStateLocked) {
 			return model.OperationDirective{}, fmt.Errorf("%w: locked gate cannot execute a directive", ErrInvalidInput)
+		}
+		if target == string(constants.DirectiveStateExecuting) {
+			if err := s.checkPermitWindow(ctx, current, linkedGate, time.Now().UTC()); err != nil {
+				return model.OperationDirective{}, err
+			}
 		}
 		gate = &linkedGate
 		if target == string(constants.DirectiveStateAborted) {
@@ -241,6 +259,52 @@ func (s *operationDirectiveService) StatusCounts(ctx context.Context) (map[strin
 func validateOperationDirectiveBusinessFields(code, name, facility, owner string) error {
 	if strings.TrimSpace(code) == "" || strings.TrimSpace(name) == "" || strings.TrimSpace(facility) == "" || strings.TrimSpace(owner) == "" {
 		return ErrInvalidInput
+	}
+	return nil
+}
+
+// validatePermitWindow enforces the create/edit contract for 调度许可条件:
+// the permitted time window must be ordered and the water level bounds must be
+// a valid non-empty range.
+func validatePermitWindow(startAt, endAt time.Time, minLevel, maxLevel float64) error {
+	if startAt.IsZero() || endAt.IsZero() {
+		return fmt.Errorf("%w: permit start and end times are required", ErrInvalidInput)
+	}
+	if !startAt.UTC().Before(endAt.UTC()) {
+		return fmt.Errorf("%w: permit start time must be earlier than end time", ErrInvalidInput)
+	}
+	if minLevel <= 0 || maxLevel <= 0 {
+		return fmt.Errorf("%w: permit water level bounds must be greater than zero", ErrInvalidInput)
+	}
+	if minLevel > maxLevel {
+		return fmt.Errorf("%w: minimum water level must not be higher than maximum water level", ErrInvalidInput)
+	}
+	return nil
+}
+
+// checkPermitWindow is the runtime gate for starting an approved directive. The
+// target gate belongs to a reservoir (GateUnit.RelatedCode is the reservoir
+// code); execution is allowed only when the current time is inside the permit
+// window and the reservoir's current water level is within the recorded
+// bounds. Any rejection happens before persistence, so the directive and the
+// gate are left in their original states.
+func (s *operationDirectiveService) checkPermitWindow(ctx context.Context, directive model.OperationDirective, gate model.GateUnit, now time.Time) error {
+	if now.Before(directive.PermitStartAt) {
+		return fmt.Errorf("%w: current time %s is before permit start %s", ErrPermitWindow,
+			now.Format(time.RFC3339), directive.PermitStartAt.Format(time.RFC3339))
+	}
+	if now.After(directive.PermitEndAt) {
+		return fmt.Errorf("%w: current time %s is after permit end %s", ErrPermitWindow,
+			now.Format(time.RFC3339), directive.PermitEndAt.Format(time.RFC3339))
+	}
+	reservoir, err := s.reservoirs.GetByCode(ctx, gate.RelatedCode)
+	if err != nil {
+		return fmt.Errorf("linked reservoir %q for gate %q: %w", gate.RelatedCode, gate.Code, err)
+	}
+	currentLevel := reservoir.MetricValue
+	if currentLevel < directive.MinWaterLevel || currentLevel > directive.MaxWaterLevel {
+		return fmt.Errorf("%w: reservoir %s current water level %.2f is outside permitted range [%.2f, %.2f]",
+			ErrPermitWindow, reservoir.Code, currentLevel, directive.MinWaterLevel, directive.MaxWaterLevel)
 	}
 	return nil
 }

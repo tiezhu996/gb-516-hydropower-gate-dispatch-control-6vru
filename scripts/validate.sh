@@ -78,11 +78,17 @@ expect_status 403 -X POST "$api/reservoirs" -H "Authorization: Bearer $viewer_to
 echo "[4/5] Two-person directive and execution flow"
 suffix=$(date +%s)
 code="OD-VAL-$suffix"
-directive_payload=$(jq -n --arg code "$code" --arg at "$now" '{code:$code,name:"右岸泄洪闸调度许可",description:"空卷运行验证",facility:"水电站闸门调度许可区域2",owner:"运行一组",category:"泄洪调度",riskLevel:"high",metricValue:35,metricUnit:"%",effectiveAt:$at,evidence:"水位窗口、设备闭锁和通信链路已核对",relatedCode:"GU-002",gateState:"open"}')
+permit_start=$(date -u -v-2H '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '2 hours ago' '+%Y-%m-%dT%H:%M:%SZ')
+permit_end=$(date -u -v+2H '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '2 hours' '+%Y-%m-%dT%H:%M:%SZ')
+directive_payload=$(jq -n --arg code "$code" --arg at "$now" --arg start "$permit_start" --arg end "$permit_end" '{code:$code,name:"右岸泄洪闸调度许可",description:"空卷运行验证",facility:"水电站闸门调度许可区域2",owner:"运行一组",category:"泄洪调度",riskLevel:"high",metricValue:35,metricUnit:"%",effectiveAt:$at,evidence:"水位窗口、设备闭锁和通信链路已核对",relatedCode:"GU-002",gateState:"open",permitStartAt:$start,permitEndAt:$end,minWaterLevel:20,maxWaterLevel:30}')
 created=$(curl -fsS -X POST "$api/directives" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -H "X-Request-ID: val-create-$suffix" -d "$directive_payload")
 id=$(printf '%s' "$created" | jq -er '.data.id')
 version=$(printf '%s' "$created" | jq -er '.data.version')
-printf '%s' "$created" | jq -e '.data.status == "draft" and .data.gateState == "open"' >/dev/null
+printf '%s' "$created" | jq -e '.data.status == "draft" and .data.gateState == "open" and .data.minWaterLevel == 20 and .data.maxWaterLevel == 30' >/dev/null
+
+# 建单校验：许可时段颠倒、水位上下限颠倒都必须拒绝。
+expect_status 422 -X POST "$api/directives" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$(printf '%s' "$directive_payload" | jq --arg c "OD-BAD-T-$suffix" '.code=$c | .permitStartAt=$end' --arg end "$permit_end")"
+expect_status 422 -X POST "$api/directives" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$(printf '%s' "$directive_payload" | jq --arg c "OD-BAD-L-$suffix" '.code=$c | .minWaterLevel=40 | .maxWaterLevel=10')"
 
 submit=$(jq -n --argjson version "$version" '{status:"pending",expectedVersion:$version,reason:"操作员提交水位窗口和目标开度复核"}')
 submitted=$(curl -fsS -X POST "$api/directives/$id/transition" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -H "X-Request-ID: val-submit-$suffix" -d "$submit")
@@ -102,6 +108,19 @@ executing=$(curl -fsS -X POST "$api/directives/$id/transition" -H "Authorization
 version=$(printf '%s' "$executing" | jq -er '.data.version')
 complete=$(jq -n --argjson version "$version" '{status:"completed",expectedVersion:$version,reason:"闸门动作与目标开度核对完成"}')
 expect_status 422 -X POST "$api/directives/$id/transition" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$complete"
+
+# 运行时校验：已复核指令若落在许可时段之外，开工必须被拒绝且指令状态保持不变。
+expired_start=$(date -u -v-6H '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '6 hours ago' '+%Y-%m-%dT%H:%M:%SZ')
+expired_end=$(date -u -v-4H '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d '4 hours ago' '+%Y-%m-%dT%H:%M:%SZ')
+expired_code="OD-EXP-$suffix"
+expired_payload=$(jq -n --arg code "$expired_code" --arg at "$now" --arg start "$expired_start" --arg end "$expired_end" '{code:$code,name:"许可时段已过的调度指令",facility:"水电站闸门调度许可区域2",owner:"运行一组",category:"泄洪调度",riskLevel:"high",metricValue:35,metricUnit:"%",effectiveAt:$at,evidence:"验证许可时段拦截",relatedCode:"GU-002",gateState:"open",permitStartAt:$start,permitEndAt:$end,minWaterLevel:20,maxWaterLevel:30}')
+expired_created=$(curl -fsS -X POST "$api/directives" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$expired_payload")
+expired_id=$(printf '%s' "$expired_created" | jq -er '.data.id')
+expired_version=$(printf '%s' "$expired_created" | jq -er '.data.version')
+expired_version=$(curl -fsS -X POST "$api/directives/$expired_id/transition" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$(jq -n --argjson version "$expired_version" '{status:"pending",expectedVersion:$version,reason:"提交复核"}')" | jq -er '.data.version')
+expired_version=$(curl -fsS -X POST "$api/directives/$expired_id/transition" -H "Authorization: Bearer $reviewer_token" -H 'Content-Type: application/json' -d "$(jq -n --argjson version "$expired_version" '{status:"approved",expectedVersion:$version,reason:"复核通过但需在许可时段内开工"}')" | jq -er '.data.version')
+expect_status 422 -X POST "$api/directives/$expired_id/transition" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$(jq -n --argjson version "$expired_version" '{status:"executing",expectedVersion:$version,reason:"尝试在许可时段外开工"}')"
+curl -fsS "$api/directives/$expired_id" -H "Authorization: Bearer $reviewer_token" | jq -e '.data.status == "approved" and .data.version == '"$expired_version" >/dev/null
 
 confirmation_code="EC-VAL-$suffix"
 confirmation_payload=$(jq -n --arg code "$confirmation_code" --arg related "$code" --arg at "$now" '{code:$code,name:"泄洪闸执行回执",description:"现场执行验证",facility:"水电站闸门调度许可区域2",owner:"运行一组",category:"执行回执",riskLevel:"high",metricValue:35,metricUnit:"%",effectiveAt:$at,evidence:"闸位反馈、视频和对讲记录已核对",relatedCode:$related}')
