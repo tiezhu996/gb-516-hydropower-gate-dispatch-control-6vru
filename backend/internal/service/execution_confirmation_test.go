@@ -22,16 +22,21 @@ func newExecutionWorkflow(t *testing.T) (ExecutionConfirmationService, Operation
 	}
 	sqlDB, _ := db.DB()
 	sqlDB.SetMaxOpenConns(1)
-	if err := db.AutoMigrate(&model.GateUnit{}, &model.OperationDirective{}, &model.DirectiveApproval{}, &model.ExecutionConfirmation{}, &model.AuditLog{}); err != nil {
+	if err := db.AutoMigrate(&model.Reservoir{}, &model.GateUnit{}, &model.OperationDirective{}, &model.DirectiveApproval{}, &model.ExecutionConfirmation{}, &model.AuditLog{}); err != nil {
 		t.Fatalf("migrate test database: %v", err)
 	}
+	reservoirRepo := repository.NewReservoirRepository(db)
 	gateRepo := repository.NewGateUnitRepository(db)
 	directiveRepo := repository.NewOperationDirectiveRepository(db)
 	confirmationRepo := repository.NewExecutionConfirmationRepository(db)
 	security := NewSecurityService(repository.NewSecurityRepository(db), config.Config{})
-	directives := NewOperationDirectiveService(directiveRepo, gateRepo, security)
+	directives := NewOperationDirectiveService(directiveRepo, gateRepo, reservoirRepo, security)
 	confirmations := NewExecutionConfirmationService(confirmationRepo, directiveRepo, gateRepo, security)
-	gate := model.GateUnit{BaseModel: model.BaseModel{Code: "GU-FLOW", Name: "泄洪闸", Status: "closed", Version: 1}, Facility: "主坝", Owner: "运行一组"}
+	reservoir := model.Reservoir{BaseModel: model.BaseModel{Code: "RS-FLOW", Name: "上游库区", Status: "normal", Version: 1}, Facility: "主坝", Owner: "运行一组", MetricValue: 168.2, MetricUnit: "m"}
+	if err := reservoirRepo.Create(context.Background(), &reservoir); err != nil {
+		t.Fatalf("create reservoir: %v", err)
+	}
+	gate := model.GateUnit{BaseModel: model.BaseModel{Code: "GU-FLOW", Name: "泄洪闸", Status: "closed", Version: 1}, Facility: "主坝", Owner: "运行一组", RelatedCode: "RS-FLOW"}
 	if err := gateRepo.Create(context.Background(), &gate); err != nil {
 		t.Fatalf("create gate: %v", err)
 	}
@@ -46,6 +51,8 @@ func prepareExecutingDirective(t *testing.T, directives OperationDirectiveServic
 		Category: "泄洪", RiskLevel: "high", MetricValue: 35, MetricUnit: "%",
 		EffectiveAt: time.Now().UTC().Add(time.Hour), Evidence: "水位与通信核对完成",
 		RelatedCode: "GU-FLOW", GateState: "open",
+		PermitStartAt: time.Now().UTC().Add(-time.Hour), PermitEndAt: time.Now().UTC().Add(24 * time.Hour),
+		MinWaterLevel: 160, MaxWaterLevel: 175,
 	}, "operator", "req-create")
 	if err != nil {
 		t.Fatalf("create directive: %v", err)

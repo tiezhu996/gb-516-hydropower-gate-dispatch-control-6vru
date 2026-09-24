@@ -25,11 +25,12 @@ type OperationDirectiveService interface {
 type operationDirectiveService struct {
 	repository repository.OperationDirectiveRepository
 	gates      repository.GateUnitRepository
+	reservoirs repository.ReservoirRepository
 	security   SecurityService
 }
 
-func NewOperationDirectiveService(repo repository.OperationDirectiveRepository, gates repository.GateUnitRepository, security SecurityService) OperationDirectiveService {
-	return &operationDirectiveService{repository: repo, gates: gates, security: security}
+func NewOperationDirectiveService(repo repository.OperationDirectiveRepository, gates repository.GateUnitRepository, reservoirs repository.ReservoirRepository, security SecurityService) OperationDirectiveService {
+	return &operationDirectiveService{repository: repo, gates: gates, reservoirs: reservoirs, security: security}
 }
 
 func (s *operationDirectiveService) List(ctx context.Context, query dto.PageQuery) (repository.Page[model.OperationDirective], error) {
@@ -55,6 +56,11 @@ func (s *operationDirectiveService) Create(ctx context.Context, input dto.Create
 	if gateState == "" {
 		gateState = string(constants.GateStateClosed)
 	}
+	permitStart := input.PermitStartAt.UTC()
+	permitEnd := input.PermitEndAt.UTC()
+	if err := validatePermitConditions(permitStart, permitEnd, input.MinWaterLevel, input.MaxWaterLevel); err != nil {
+		return model.OperationDirective{}, err
+	}
 	item := model.OperationDirective{
 		BaseModel: model.BaseModel{
 			Code: strings.ToUpper(strings.TrimSpace(input.Code)), Name: strings.TrimSpace(input.Name),
@@ -65,6 +71,8 @@ func (s *operationDirectiveService) Create(ctx context.Context, input dto.Create
 		MetricValue: input.MetricValue, MetricUnit: strings.TrimSpace(input.MetricUnit),
 		EffectiveAt: input.EffectiveAt.UTC(), Evidence: strings.TrimSpace(input.Evidence),
 		RelatedCode: strings.ToUpper(strings.TrimSpace(input.RelatedCode)), GateState: gateState,
+		PermitStartAt: permitStart, PermitEndAt: permitEnd,
+		MinWaterLevel: input.MinWaterLevel, MaxWaterLevel: input.MaxWaterLevel,
 	}
 	if err := s.security.WithinTransaction(ctx, func(txCtx context.Context) error {
 		if err := s.repository.Create(txCtx, &item); err != nil {
@@ -95,6 +103,11 @@ func (s *operationDirectiveService) Update(ctx context.Context, id uint, input d
 	if !strings.EqualFold(strings.TrimSpace(input.Facility), gate.Facility) || gate.Status == string(constants.GateStateLocked) {
 		return model.OperationDirective{}, fmt.Errorf("%w: linked gate is locked or belongs to another facility", ErrInvalidInput)
 	}
+	permitStart := input.PermitStartAt.UTC()
+	permitEnd := input.PermitEndAt.UTC()
+	if err := validatePermitConditions(permitStart, permitEnd, input.MinWaterLevel, input.MaxWaterLevel); err != nil {
+		return model.OperationDirective{}, err
+	}
 	current.Name = strings.TrimSpace(input.Name)
 	current.Description = strings.TrimSpace(input.Description)
 	current.Facility = strings.TrimSpace(input.Facility)
@@ -106,6 +119,10 @@ func (s *operationDirectiveService) Update(ctx context.Context, id uint, input d
 	current.EffectiveAt = input.EffectiveAt.UTC()
 	current.Evidence = strings.TrimSpace(input.Evidence)
 	current.RelatedCode = strings.ToUpper(strings.TrimSpace(input.RelatedCode))
+	current.PermitStartAt = permitStart
+	current.PermitEndAt = permitEnd
+	current.MinWaterLevel = input.MinWaterLevel
+	current.MaxWaterLevel = input.MaxWaterLevel
 	if gateState := strings.TrimSpace(input.GateState); gateState != "" {
 		current.GateState = gateState
 	}
@@ -146,6 +163,11 @@ func (s *operationDirectiveService) Transition(ctx context.Context, id uint, inp
 		}
 		if target == string(constants.DirectiveStateExecuting) && linkedGate.Status == string(constants.GateStateLocked) {
 			return model.OperationDirective{}, fmt.Errorf("%w: locked gate cannot execute a directive", ErrInvalidInput)
+		}
+		if target == string(constants.DirectiveStateExecuting) {
+			if err := s.checkPermitConditions(ctx, &linkedGate, &current, time.Now().UTC()); err != nil {
+				return model.OperationDirective{}, err
+			}
 		}
 		gate = &linkedGate
 		if target == string(constants.DirectiveStateAborted) {
@@ -241,6 +263,40 @@ func (s *operationDirectiveService) StatusCounts(ctx context.Context) (map[strin
 func validateOperationDirectiveBusinessFields(code, name, facility, owner string) error {
 	if strings.TrimSpace(code) == "" || strings.TrimSpace(name) == "" || strings.TrimSpace(facility) == "" || strings.TrimSpace(owner) == "" {
 		return ErrInvalidInput
+	}
+	return nil
+}
+
+// validatePermitConditions enforces the creation-time shape of the dispatch
+// permit: the window must be ordered and the water level bounds must be
+// positive and ordered.
+func validatePermitConditions(start, end time.Time, minLevel, maxLevel float64) error {
+	if start.IsZero() || end.IsZero() || !start.Before(end) {
+		return fmt.Errorf("%w: permit start time must be earlier than permit end time", ErrInvalidInput)
+	}
+	if minLevel <= 0 || maxLevel <= 0 || minLevel > maxLevel {
+		return fmt.Errorf("%w: minimum water level must be positive and not exceed the maximum water level", ErrInvalidInput)
+	}
+	return nil
+}
+
+// checkPermitConditions gates the approved -> executing transition: the current
+// instant must fall inside the permit window and the current level of the
+// reservoir linked to the target gate must stay within the permitted bounds.
+// Any violation rejects the transition before state or gate changes persist.
+func (s *operationDirectiveService) checkPermitConditions(ctx context.Context, gate *model.GateUnit, directive *model.OperationDirective, now time.Time) error {
+	if now.Before(directive.PermitStartAt) || now.After(directive.PermitEndAt) {
+		return fmt.Errorf("%w: current time %s is outside the permit window %s to %s", ErrPermitCondition,
+			now.Format(time.RFC3339), directive.PermitStartAt.Format(time.RFC3339), directive.PermitEndAt.Format(time.RFC3339))
+	}
+	reservoir, err := s.reservoirs.GetByCode(ctx, gate.RelatedCode)
+	if err != nil {
+		return fmt.Errorf("%w: cannot read water level of linked reservoir %q: %v", ErrPermitCondition, gate.RelatedCode, err)
+	}
+	level := reservoir.MetricValue
+	if level < directive.MinWaterLevel || level > directive.MaxWaterLevel {
+		return fmt.Errorf("%w: reservoir %s water level %.2f is outside the permitted range %.2f to %.2f", ErrPermitCondition,
+			reservoir.Code, level, directive.MinWaterLevel, directive.MaxWaterLevel)
 	}
 	return nil
 }

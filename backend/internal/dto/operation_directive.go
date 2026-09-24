@@ -3,7 +3,8 @@ package dto
 import "time"
 
 // CreateOperationDirective is the public write contract for 操作指令. Status is deliberately
-// omitted so callers cannot bypass the service state machine.
+// omitted so callers cannot bypass the service state machine. The permit window and water
+// level bounds gate the approved -> executing transition and are required on creation.
 type CreateOperationDirective struct {
 	Code        string    `json:"code" binding:"required,min=2,max=64"`
 	Name        string    `json:"name" binding:"required,min=2,max=160"`
@@ -18,6 +19,11 @@ type CreateOperationDirective struct {
 	Evidence    string    `json:"evidence" binding:"max=2000"`
 	RelatedCode string    `json:"relatedCode" binding:"required,min=2,max=64"`
 	GateState   string    `json:"gateState" binding:"omitempty,oneof=open closed locked"`
+
+	PermitStartAt time.Time `json:"permitStartAt" binding:"required"`
+	PermitEndAt   time.Time `json:"permitEndAt" binding:"required"`
+	MinWaterLevel float64   `json:"minWaterLevel"`
+	MaxWaterLevel float64   `json:"maxWaterLevel"`
 }
 
 type UpdateOperationDirective struct {
@@ -34,4 +40,9 @@ type UpdateOperationDirective struct {
 	Evidence        string    `json:"evidence" binding:"max=2000"`
 	RelatedCode     string    `json:"relatedCode" binding:"required,min=2,max=64"`
 	GateState       string    `json:"gateState" binding:"omitempty,oneof=open closed locked"`
+
+	PermitStartAt time.Time `json:"permitStartAt" binding:"required"`
+	PermitEndAt   time.Time `json:"permitEndAt" binding:"required"`
+	MinWaterLevel float64   `json:"minWaterLevel"`
+	MaxWaterLevel float64   `json:"maxWaterLevel"`
 }

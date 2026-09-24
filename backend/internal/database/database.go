@@ -198,18 +198,21 @@ func seedOperationDirective(ctx context.Context, db *gorm.DB) error {
 		{BaseModel: model.BaseModel{Code: "OD-001", Name: "操作指令示例一", Status: "draft", Version: 1,
 			Description: "用于启动验证和主要流程演示的操作指令记录"}, Facility: "水电站闸门调度许可区域1", Owner: "运行一组",
 			Category: "常规", RiskLevel: "low", MetricValue: 12.5, MetricUnit: "unit",
-			EffectiveAt: now.Add(0 * time.Hour), Evidence: "已核对库水位与机组工况", RelatedCode: "GU-001", GateState: "open"},
+			EffectiveAt: now.Add(0 * time.Hour), Evidence: "已核对库水位与机组工况", RelatedCode: "GU-001", GateState: "open",
+			PermitStartAt: now.Add(-time.Hour), PermitEndAt: now.Add(24 * time.Hour), MinWaterLevel: 10, MaxWaterLevel: 15},
 
 		{BaseModel: model.BaseModel{Code: "OD-002", Name: "操作指令示例二", Status: "pending", Version: 1,
 			Description: "用于启动验证和主要流程演示的操作指令记录"}, Facility: "水电站闸门调度许可区域2", Owner: "质量复核组",
 			Category: "重点", RiskLevel: "medium", MetricValue: 25.0, MetricUnit: "%",
 			EffectiveAt: now.Add(3 * time.Hour), Evidence: "待安全复核员完成第二人确认", RelatedCode: "GU-002", GateState: "closed",
+			PermitStartAt: now.Add(-time.Hour), PermitEndAt: now.Add(24 * time.Hour), MinWaterLevel: 20, MaxWaterLevel: 30,
 			SubmittedBy: "operator", SubmittedAt: &submittedAt},
 
 		{BaseModel: model.BaseModel{Code: "OD-003", Name: "右岸泄洪闸开启指令", Status: "executing", Version: 1,
 			Description: "用于启动验证和主要流程演示的操作指令记录"}, Facility: "水电站闸门调度许可区域3", Owner: "安全主管组",
 			Category: "复核", RiskLevel: "high", MetricValue: 37.5, MetricUnit: "score",
 			EffectiveAt: now.Add(6 * time.Hour), Evidence: "双人确认已完成，现场正在执行", RelatedCode: "GU-003", GateState: "open",
+			PermitStartAt: now.Add(-2 * time.Hour), PermitEndAt: now.Add(24 * time.Hour), MinWaterLevel: 30, MaxWaterLevel: 45,
 			SubmittedBy: "operator", SubmittedAt: &submittedAt, ApprovedBy: "reviewer", ApprovedAt: &approvedAt},
 	}
 	if err := db.WithContext(ctx).Create(&items).Error; err != nil {

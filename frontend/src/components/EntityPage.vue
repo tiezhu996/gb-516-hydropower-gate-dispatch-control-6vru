@@ -23,6 +23,23 @@ const relatedOptions = ref<DomainRecord[]>([]);
 const createForm = reactive({
   code: '', name: '', description: '', facility: '', owner: '', category: '',
   riskLevel: 'medium', metricValue: 0, metricUnit: '%', evidence: '', relatedCode: '', gateState: 'closed',
+  permitRange: [] as Date[], minWaterLevel: 160, maxWaterLevel: 175,
+});
+const reservoirOptions = ref<DomainRecord[]>([]);
+
+const permitWindowReady = computed(() => {
+  if (props.config.key !== 'operationDirective') return true;
+  const [start, end] = createForm.permitRange;
+  return Boolean(start && end && start.getTime() < end.getTime());
+});
+const permitLevelReady = computed(() => {
+  if (props.config.key !== 'operationDirective') return true;
+  return createForm.minWaterLevel > 0 && createForm.maxWaterLevel >= createForm.minWaterLevel;
+});
+const permitHint = computed(() => {
+  if (props.config.key !== 'operationDirective' || (permitWindowReady.value && permitLevelReady.value)) return '';
+  if (!permitWindowReady.value) return '许可开始时间必须早于结束时间';
+  return '最低水位必须为正数且不高于最高水位';
 });
 
 const highRisk = computed(() => props.store.items.filter((item: DomainRecord) => ['high', 'critical'].includes(item.riskLevel)).length);
@@ -50,7 +67,8 @@ const relationLabel = computed(() => ({ gateUnit: '所属库区', operationDirec
 const createReady = computed(() => Boolean(
 	createForm.code.trim() && createForm.name.trim() && createForm.facility.trim() && createForm.owner.trim() &&
 	createForm.category.trim() && createForm.evidence.trim() &&
-	(!['gateUnit', 'operationDirective', 'executionConfirmation'].includes(props.config.key) || createForm.relatedCode),
+	(!['gateUnit', 'operationDirective', 'executionConfirmation'].includes(props.config.key) || createForm.relatedCode) &&
+	permitWindowReady.value && permitLevelReady.value,
 ));
 
 async function prepareCreate(): Promise<void> {
@@ -66,6 +84,12 @@ async function prepareCreate(): Promise<void> {
 	createForm.evidence = '';
 	createForm.relatedCode = '';
   createForm.gateState = 'closed';
+	const start = new Date();
+	const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+	createForm.permitRange = [start, end];
+	createForm.minWaterLevel = 160;
+	createForm.maxWaterLevel = 175;
+	reservoirOptions.value = [];
 	relatedOptions.value = [];
 	const relationPaths: Record<string, string> = { gateUnit: 'reservoirs', operationDirective: 'gates', executionConfirmation: 'directives' };
 	try {
@@ -78,9 +102,23 @@ async function prepareCreate(): Promise<void> {
 			);
 			selectRelated(relatedOptions.value[0]?.code || '');
 		}
+		if (props.config.key === 'operationDirective') {
+			const reservoirs = await request<DomainRecord[]>('/reservoirs?page=1&pageSize=100');
+			reservoirOptions.value = reservoirs.data;
+			syncWaterBoundsFromGate(createForm.relatedCode);
+		}
 		showCreate.value = true;
 	} catch (reason) {
 		props.store.error = reason instanceof Error ? reason.message : String(reason);
+	}
+}
+
+function syncWaterBoundsFromGate(gateCode: string): void {
+	const gate = relatedOptions.value.find((item) => item.code === gateCode);
+	const reservoir = gate ? reservoirOptions.value.find((item) => item.code === gate.relatedCode) : undefined;
+	if (reservoir) {
+		createForm.minWaterLevel = Math.max(0, Number((reservoir.metricValue - 5).toFixed(2)));
+		createForm.maxWaterLevel = Number((reservoir.metricValue + 5).toFixed(2));
 	}
 }
 
@@ -88,14 +126,25 @@ function selectRelated(code: string): void {
 	createForm.relatedCode = code;
 	const related = relatedOptions.value.find((item) => item.code === code);
 	if (related) createForm.facility = related.facility;
+	if (props.config.key === 'operationDirective') syncWaterBoundsFromGate(code);
 }
 
 async function createRecord(): Promise<void> {
 	if (!createReady.value) {
-		props.store.error = '请完整填写必填业务字段和现场证据';
+		props.store.error = props.config.key === 'operationDirective' && permitHint.value
+			? `请完整填写必填业务字段和现场证据：${permitHint.value}`
+			: '请完整填写必填业务字段和现场证据';
 		return;
 	}
-  await props.store.createRecord(props.config.path, { ...createForm, effectiveAt: new Date().toISOString() });
+	const { permitRange, minWaterLevel, maxWaterLevel, ...baseForm } = createForm;
+	const payload: Record<string, unknown> = { ...baseForm, effectiveAt: new Date().toISOString() };
+	if (props.config.key === 'operationDirective') {
+		payload.permitStartAt = permitRange[0]?.toISOString();
+		payload.permitEndAt = permitRange[1]?.toISOString();
+		payload.minWaterLevel = minWaterLevel;
+		payload.maxWaterLevel = maxWaterLevel;
+	}
+  await props.store.createRecord(props.config.path, payload);
   if (!props.store.error) showCreate.value = false;
 }
 
@@ -165,6 +214,14 @@ async function confirmTransition(): Promise<void> {
 		<el-table-column v-if="config.key === 'operationDirective'" label="目标状态" width="120">
           <template #default="{ row }"><GateStateBadge :state="row.gateState || 'closed'" /></template>
         </el-table-column>
+		<el-table-column v-if="config.key === 'operationDirective'" label="许可时段" width="320">
+          <template #default="{ row }">
+            <small>{{ formatDate(row.permitStartAt) }} 至<br />{{ formatDate(row.permitEndAt) }}</small>
+          </template>
+        </el-table-column>
+		<el-table-column v-if="config.key === 'operationDirective'" label="许可水位" width="150">
+          <template #default="{ row }"><small>{{ row.minWaterLevel }} ~ {{ row.maxWaterLevel }}</small></template>
+        </el-table-column>
 		<el-table-column label="风险" width="80"><template #default="{ row }">{{ riskLabel(row.riskLevel) }}</template></el-table-column>
         <el-table-column prop="owner" label="责任人" min-width="110" />
 		<el-table-column v-if="['gateUnit', 'operationDirective', 'executionConfirmation'].includes(config.key)" prop="relatedCode" :label="relationLabel" width="130" />
@@ -199,6 +256,23 @@ async function confirmTransition(): Promise<void> {
 		  <el-form-item :label="metricLabel"><el-input-number v-model="createForm.metricValue" :min="0" :precision="2" controls-position="right" /></el-form-item>
 		  <el-form-item label="指标单位"><el-input v-model="createForm.metricUnit" /></el-form-item>
 		  <el-form-item v-if="config.key === 'operationDirective'" label="目标闸门状态"><el-select v-model="createForm.gateState"><el-option v-for="state in ['open', 'closed', 'locked']" :key="state" :label="statusLabel(state)" :value="state" /></el-select></el-form-item>
+		  <template v-if="config.key === 'operationDirective'">
+			<el-form-item label="许可开始时间" required>
+				<el-date-picker v-model="createForm.permitRange[0]" type="datetime" placeholder="选择许可开始时间" class="permit-datetime" />
+			</el-form-item>
+			<el-form-item label="许可结束时间" required>
+				<el-date-picker v-model="createForm.permitRange[1]" type="datetime" placeholder="选择许可结束时间" class="permit-datetime" />
+			</el-form-item>
+			<el-form-item label="最低水位" required>
+				<el-input-number v-model="createForm.minWaterLevel" :min="0" :precision="2" controls-position="right" class="permit-level" />
+			</el-form-item>
+			<el-form-item label="最高水位" required>
+				<el-input-number v-model="createForm.maxWaterLevel" :min="0" :precision="2" controls-position="right" class="permit-level" />
+			</el-form-item>
+			<el-form-item v-if="permitHint" label=" ">
+				<el-alert :title="permitHint" type="warning" show-icon :closable="false" />
+			</el-form-item>
+		  </template>
         </div>
 		<el-form-item label="业务说明"><el-input v-model="createForm.description" type="textarea" :rows="2" maxlength="1000" show-word-limit /></el-form-item>
         <el-form-item label="现场证据"><el-input v-model="createForm.evidence" type="textarea" :rows="3" /></el-form-item>
@@ -207,6 +281,11 @@ async function confirmTransition(): Promise<void> {
 
     <ConfirmDialog :model-value="Boolean(pending)" title="确认状态迁移" confirm-label="确认并记录审计" @update:model-value="pending = null" @confirm="confirmTransition">
       <p>此次操作会校验角色和版本，并将状态、请求 ID 与审计证据原子写入。</p>
+      <el-alert
+        v-if="config.key === 'operationDirective' && pending?.status === 'executing'"
+        title="开始执行时会按目标闸门关联库区实时读取水位；仅当当前时间落在许可时段且水位处于最低/最高水位之间才允许动作，否则指令与闸门保持原状态。"
+        type="info" show-icon :closable="false" class="transition-permit-note"
+      />
       <div class="transition-summary"><StatusBadge :status="pending?.item.status || ''" /><span>到</span><StatusBadge :status="pending?.status || ''" /></div>
       <el-input v-model="transitionReason" type="textarea" :rows="3" maxlength="500" show-word-limit aria-label="迁移原因" />
     </ConfirmDialog>

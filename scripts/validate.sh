@@ -78,11 +78,18 @@ expect_status 403 -X POST "$api/reservoirs" -H "Authorization: Bearer $viewer_to
 echo "[4/5] Two-person directive and execution flow"
 suffix=$(date +%s)
 code="OD-VAL-$suffix"
-directive_payload=$(jq -n --arg code "$code" --arg at "$now" '{code:$code,name:"右岸泄洪闸调度许可",description:"空卷运行验证",facility:"水电站闸门调度许可区域2",owner:"运行一组",category:"泄洪调度",riskLevel:"high",metricValue:35,metricUnit:"%",effectiveAt:$at,evidence:"水位窗口、设备闭锁和通信链路已核对",relatedCode:"GU-002",gateState:"open"}')
+permit_start=$now
+permit_end=$(date -u -d '24 hours' '+%Y-%m-%dT%H:%M:%SZ')
+directive_payload=$(jq -n --arg code "$code" --arg at "$now" --arg ps "$permit_start" --arg pe "$permit_end" '{code:$code,name:"右岸泄洪闸调度许可",description:"空卷运行验证",facility:"水电站闸门调度许可区域2",owner:"运行一组",category:"泄洪调度",riskLevel:"high",metricValue:35,metricUnit:"%",effectiveAt:$at,evidence:"水位窗口、设备闭锁和通信链路已核对",relatedCode:"GU-002",gateState:"open",permitStartAt:$ps,permitEndAt:$pe,minWaterLevel:20,maxWaterLevel:30}')
 created=$(curl -fsS -X POST "$api/directives" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -H "X-Request-ID: val-create-$suffix" -d "$directive_payload")
 id=$(printf '%s' "$created" | jq -er '.data.id')
 version=$(printf '%s' "$created" | jq -er '.data.version')
-printf '%s' "$created" | jq -e '.data.status == "draft" and .data.gateState == "open"' >/dev/null
+printf '%s' "$created" | jq -e '.data.status == "draft" and .data.gateState == "open" and .data.minWaterLevel == 20 and .data.maxWaterLevel == 30 and .data.permitStartAt and .data.permitEndAt' >/dev/null
+
+inverted_window=$(jq -n --arg code "OD-VAL-WIN-$suffix" --arg at "$now" --arg ps "$permit_end" --arg pe "$permit_start" '{code:$code,name:"许可时段倒置指令",facility:"水电站闸门调度许可区域2",owner:"运行一组",category:"泄洪调度",riskLevel:"high",metricValue:35,metricUnit:"%",effectiveAt:$at,evidence:"建单时段校验必须拒绝",relatedCode:"GU-002",gateState:"open",permitStartAt:$ps,permitEndAt:$pe,minWaterLevel:20,maxWaterLevel:30}')
+expect_status 422 -X POST "$api/directives" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$inverted_window"
+inverted_level=$(jq -n --arg code "OD-VAL-LVL-$suffix" --arg at "$now" --arg ps "$permit_start" --arg pe "$permit_end" '{code:$code,name:"水位上下限倒置指令",facility:"水电站闸门调度许可区域2",owner:"运行一组",category:"泄洪调度",riskLevel:"high",metricValue:35,metricUnit:"%",effectiveAt:$at,evidence:"建单水位校验必须拒绝",relatedCode:"GU-002",gateState:"open",permitStartAt:$ps,permitEndAt:$pe,minWaterLevel:30,maxWaterLevel:20}')
+expect_status 422 -X POST "$api/directives" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$inverted_level"
 
 submit=$(jq -n --argjson version "$version" '{status:"pending",expectedVersion:$version,reason:"操作员提交水位窗口和目标开度复核"}')
 submitted=$(curl -fsS -X POST "$api/directives/$id/transition" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -H "X-Request-ID: val-submit-$suffix" -d "$submit")
@@ -95,6 +102,22 @@ approve=$(jq -n --argjson version "$version" '{status:"approved",expectedVersion
 approved=$(curl -fsS -X POST "$api/directives/$id/transition" -H "Authorization: Bearer $reviewer_token" -H 'Content-Type: application/json' -H "X-Request-ID: val-approve-$suffix" -d "$approve")
 version=$(printf '%s' "$approved" | jq -er '.data.version')
 printf '%s' "$approved" | jq -e --arg request "val-approve-$suffix" '.data.status == "approved" and .data.submittedBy == "operator" and .data.approvedBy == "reviewer" and .data.submittedBy != .data.approvedBy and (.data.approvals | length) == 2 and .data.approvals[1].requestId == $request' >/dev/null
+
+deny_code="OD-VAL-DENY-$suffix"
+deny_payload=$(jq -n --arg code "$deny_code" --arg at "$now" --arg ps "$permit_start" --arg pe "$permit_end" '{code:$code,name:"水位越限开工指令",description:"运行时许可拦截验证",facility:"水电站闸门调度许可区域1",owner:"运行一组",category:"泄洪调度",riskLevel:"high",metricValue:35,metricUnit:"%",effectiveAt:$at,evidence:"水位超出上下限时不得开工",relatedCode:"GU-001",gateState:"closed",permitStartAt:$ps,permitEndAt:$pe,minWaterLevel:100,maxWaterLevel:110}')
+deny_created=$(curl -fsS -X POST "$api/directives" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$deny_payload")
+deny_id=$(printf '%s' "$deny_created" | jq -er '.data.id')
+deny_version=$(printf '%s' "$deny_created" | jq -er '.data.version')
+deny_submit=$(jq -n --argjson version "$deny_version" '{status:"pending",expectedVersion:$version,reason:"提交水位越限指令复核"}')
+deny_submitted=$(curl -fsS -X POST "$api/directives/$deny_id/transition" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$deny_submit")
+deny_version=$(printf '%s' "$deny_submitted" | jq -er '.data.version')
+deny_approve=$(jq -n --argjson version "$deny_version" '{status:"approved",expectedVersion:$version,reason:"复核通过，但开工时仍须实时校验水位"}')
+deny_approved=$(curl -fsS -X POST "$api/directives/$deny_id/transition" -H "Authorization: Bearer $reviewer_token" -H 'Content-Type: application/json' -d "$deny_approve")
+deny_version=$(printf '%s' "$deny_approved" | jq -er '.data.version')
+deny_execute=$(jq -n --argjson version "$deny_version" '{status:"executing",expectedVersion:$version,reason:"水位越限仍试图开工"}')
+expect_status 422 -X POST "$api/directives/$deny_id/transition" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$deny_execute"
+curl -fsS "$api/directives/$deny_id" -H "Authorization: Bearer $operator_token" | jq -e '.data.status == "approved"' >/dev/null
+curl -fsS "$api/gates/1" -H "Authorization: Bearer $operator_token" | jq -e '.data.status == "open"' >/dev/null
 
 expect_status 409 -X PUT "$api/directives/$id" -H "Authorization: Bearer $operator_token" -H 'Content-Type: application/json' -d "$(printf '%s' "$directive_payload" | jq --argjson version "$version" '. + {expectedVersion:$version}')"
 execute=$(jq -n --argjson version "$version" '{status:"executing",expectedVersion:$version,reason:"双人许可完成，现场开始执行"}')

@@ -16,6 +16,10 @@ export interface DomainRecord {
   evidence: string;
 	relatedCode: string;
 	gateState?: 'open' | 'closed' | 'moving' | 'locked';
+	permitStartAt?: string;
+	permitEndAt?: string;
+	minWaterLevel?: number;
+	maxWaterLevel?: number;
 	submittedBy?: string;
 	submittedAt?: string;
 	approvedBy?: string;

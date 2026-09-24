@@ -73,6 +73,9 @@ td small { display: block; color: #7d8d97; margin-top: 4px; }
 .approval-steps .pending-step { color: #7d5307; font-size: 12px; }
 .row-actions { display: flex; flex-wrap: wrap; gap: 2px; }
 .record-form .el-form-item { margin-bottom: 14px; }
+.permit-datetime { width: 100%; }
+.permit-level { width: 100%; }
+.transition-permit-note { margin: 0 0 12px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
 .transition-summary { display: flex; align-items: center; gap: 10px; margin: 14px 0; }
 .el-alert { margin-bottom: 12px; }

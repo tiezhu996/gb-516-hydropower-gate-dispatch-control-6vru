@@ -27,15 +27,19 @@ func newDirectiveService(t *testing.T) (OperationDirectiveService, *gorm.DB) {
 		t.Fatalf("database handle: %v", err)
 	}
 	sqlDB.SetMaxOpenConns(1)
-	if err := db.AutoMigrate(&model.GateUnit{}, &model.OperationDirective{}, &model.DirectiveApproval{}, &model.AuditLog{}); err != nil {
+	if err := db.AutoMigrate(&model.Reservoir{}, &model.GateUnit{}, &model.OperationDirective{}, &model.DirectiveApproval{}, &model.AuditLog{}); err != nil {
 		t.Fatalf("migrate test database: %v", err)
 	}
-	gate := model.GateUnit{BaseModel: model.BaseModel{Code: "GU-TEST", Name: "右岸泄洪闸", Status: "closed", Version: 1}, Facility: "右岸坝段", Owner: "运行一组"}
+	reservoir := model.Reservoir{BaseModel: model.BaseModel{Code: "RS-TEST", Name: "上游库区", Status: "normal", Version: 1}, Facility: "右岸坝段", Owner: "运行一组", MetricValue: 168.2, MetricUnit: "m"}
+	if err := db.Create(&reservoir).Error; err != nil {
+		t.Fatalf("create test reservoir: %v", err)
+	}
+	gate := model.GateUnit{BaseModel: model.BaseModel{Code: "GU-TEST", Name: "右岸泄洪闸", Status: "closed", Version: 1}, Facility: "右岸坝段", Owner: "运行一组", RelatedCode: "RS-TEST"}
 	if err := db.Create(&gate).Error; err != nil {
 		t.Fatalf("create test gate: %v", err)
 	}
 	security := NewSecurityService(repository.NewSecurityRepository(db), config.Config{})
-	return NewOperationDirectiveService(repository.NewOperationDirectiveRepository(db), repository.NewGateUnitRepository(db), security), db
+	return NewOperationDirectiveService(repository.NewOperationDirectiveRepository(db), repository.NewGateUnitRepository(db), repository.NewReservoirRepository(db), security), db
 }
 
 func directiveInput(code string) dto.CreateOperationDirective {
@@ -44,6 +48,8 @@ func directiveInput(code string) dto.CreateOperationDirective {
 		Facility: "右岸坝段", Owner: "运行一组", Category: "泄洪调度", RiskLevel: "high",
 		MetricValue: 35, MetricUnit: "%", EffectiveAt: time.Now().UTC().Add(time.Hour),
 		Evidence: "水位 168.2m，处于许可窗口", RelatedCode: "GU-TEST", GateState: "closed",
+		PermitStartAt: time.Now().UTC().Add(-time.Hour), PermitEndAt: time.Now().UTC().Add(24 * time.Hour),
+		MinWaterLevel: 160, MaxWaterLevel: 175,
 	}
 }
 
@@ -143,5 +149,126 @@ func TestDirectiveCreateRollsBackWhenAuditCannotPersist(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("directive persisted without audit: count=%d", count)
+	}
+}
+
+func approveDirectiveForPermitTest(t *testing.T, service OperationDirectiveService, created model.OperationDirective) model.OperationDirective {
+	t.Helper()
+	ctx := context.Background()
+	submitted, err := service.Transition(ctx, created.ID, dto.TransitionRequest{
+		Status: "pending", ExpectedVersion: created.Version, Reason: "提交许可时段与水位上下限复核",
+	}, "operator", model.RoleOperator, "req-submit")
+	if err != nil {
+		t.Fatalf("submit directive: %v", err)
+	}
+	approved, err := service.Transition(ctx, submitted.ID, dto.TransitionRequest{
+		Status: "approved", ExpectedVersion: submitted.Version, Reason: "复核通过",
+	}, "reviewer", model.RoleReviewer, "req-approve")
+	if err != nil {
+		t.Fatalf("approve directive: %v", err)
+	}
+	return approved
+}
+
+func TestDirectiveRejectsInvalidPermitConditionsOnCreate(t *testing.T) {
+	service, db := newDirectiveService(t)
+	ctx := context.Background()
+
+	invalidWindow := directiveInput("OD-TEST-WINDOW")
+	invalidWindow.PermitStartAt = time.Now().UTC().Add(time.Hour)
+	invalidWindow.PermitEndAt = time.Now().UTC().Add(-time.Hour)
+	if _, err := service.Create(ctx, invalidWindow, "operator", "req-create-window"); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("inverted permit window must be rejected at creation, got %v", err)
+	}
+
+	invalidLevel := directiveInput("OD-TEST-LEVEL")
+	invalidLevel.MinWaterLevel = 180
+	invalidLevel.MaxWaterLevel = 160
+	if _, err := service.Create(ctx, invalidLevel, "operator", "req-create-level"); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("inverted water level bounds must be rejected at creation, got %v", err)
+	}
+
+	var count int64
+	if err := db.Model(&model.OperationDirective{}).Count(&count).Error; err != nil {
+		t.Fatalf("count directives: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("directives with invalid permit conditions must not persist, count=%d", count)
+	}
+}
+
+func TestDirectiveExecutionRequiresPermitWindowAndWaterLevel(t *testing.T) {
+	service, db := newDirectiveService(t)
+	ctx := context.Background()
+	assertUntouched := func(directiveID uint, approvedVersion uint) {
+		t.Helper()
+		stored, getErr := service.Get(ctx, directiveID)
+		if getErr != nil {
+			t.Fatalf("reload denied directive: %v", getErr)
+		}
+		if stored.Status != "approved" || stored.Version != approvedVersion {
+			t.Fatalf("denied directive must keep its state: %#v", stored)
+		}
+		var gate model.GateUnit
+		if err := db.First(&gate, "code = ?", "GU-TEST").Error; err != nil {
+			t.Fatalf("load linked gate: %v", err)
+		}
+		if gate.Status != "closed" {
+			t.Fatalf("gate must remain closed after denied execution, got %s", gate.Status)
+		}
+	}
+
+	expired := directiveInput("OD-TEST-EXPIRED")
+	expired.PermitStartAt = time.Now().UTC().Add(-2 * time.Hour)
+	expired.PermitEndAt = time.Now().UTC().Add(-time.Hour)
+	created, err := service.Create(ctx, expired, "operator", "req-create-expired")
+	if err != nil {
+		t.Fatalf("create expired-window directive: %v", err)
+	}
+	approved := approveDirectiveForPermitTest(t, service, created)
+	if _, err := service.Transition(ctx, approved.ID, dto.TransitionRequest{
+		Status: "executing", ExpectedVersion: approved.Version, Reason: "许可时段已结束仍试图开工",
+	}, "operator", model.RoleOperator, "req-execute-expired"); !errors.Is(err, ErrPermitCondition) {
+		t.Fatalf("execution outside the permit window must be denied, got %v", err)
+	}
+	assertUntouched(approved.ID, approved.Version)
+
+	levelOut := directiveInput("OD-TEST-LEVEL-OUT")
+	levelOut.MinWaterLevel = 200
+	levelOut.MaxWaterLevel = 210
+	created, err = service.Create(ctx, levelOut, "operator", "req-create-level-out")
+	if err != nil {
+		t.Fatalf("create out-of-level directive: %v", err)
+	}
+	approved = approveDirectiveForPermitTest(t, service, created)
+	if _, err := service.Transition(ctx, approved.ID, dto.TransitionRequest{
+		Status: "executing", ExpectedVersion: approved.Version, Reason: "水位超出许可上下限仍试图开工",
+	}, "operator", model.RoleOperator, "req-execute-level-out"); !errors.Is(err, ErrPermitCondition) {
+		t.Fatalf("execution with water level out of bounds must be denied, got %v", err)
+	}
+	assertUntouched(approved.ID, approved.Version)
+
+	permitted := directiveInput("OD-TEST-PERMITTED")
+	permitted.GateState = "open"
+	created, err = service.Create(ctx, permitted, "operator", "req-create-permitted")
+	if err != nil {
+		t.Fatalf("create permitted directive: %v", err)
+	}
+	approved = approveDirectiveForPermitTest(t, service, created)
+	executing, err := service.Transition(ctx, approved.ID, dto.TransitionRequest{
+		Status: "executing", ExpectedVersion: approved.Version, Reason: "时间与水位均满足许可条件，开始执行",
+	}, "operator", model.RoleOperator, "req-execute-permitted")
+	if err != nil {
+		t.Fatalf("execution within permit window and water level bounds must pass: %v", err)
+	}
+	if executing.Status != "executing" {
+		t.Fatalf("directive should be executing, got %s", executing.Status)
+	}
+	var gate model.GateUnit
+	if err := db.First(&gate, "code = ?", "GU-TEST").Error; err != nil {
+		t.Fatalf("load linked gate: %v", err)
+	}
+	if gate.Status != "moving" {
+		t.Fatalf("gate should enter moving once permitted execution starts, got %s", gate.Status)
 	}
 }

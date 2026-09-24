@@ -8,6 +8,7 @@ var (
 	ErrForbidden         = errors.New("role is not permitted for this operation")
 	ErrTwoPersonRequired = errors.New("submitter and approver must be different users")
 	ErrImmutableState    = errors.New("record can no longer be edited in its current state")
+	ErrPermitCondition   = errors.New("dispatch permit conditions are not satisfied")
 	ErrUnauthorized      = errors.New("invalid username or password")
 	ErrInactiveUser      = errors.New("user account is inactive")
 )
